@@ -201,14 +201,14 @@ def svg_optimize_img_visual(device, shapes, shape_groups,
 
 def compute_saliency_map(device: torch.device, target_img: np.ndarray):
     model = TranSalNet()
-    model.load_state_dict(torch.load(r'./TranSalNet/pretrained_models/TranSalNet_Res.pth'))
+    model.load_state_dict(torch.load(r'./TranSalNet/pretrained_models/TranSalNet_Res.pth', map_location=device))
     model = model.to(device) 
     model.eval()
     img = preprocess_img(target_img) # padding and resizing input image into 384x288
     img = np.array(img)/255.
     img = np.expand_dims(np.transpose(img,(2,0,1)),axis=0)
     img = torch.from_numpy(img)
-    img = img.type(torch.cuda.FloatTensor).to(device)
+    img = img.to(device, dtype=torch.float32)
     pred_saliency = model(img)
     toPIL = transforms.ToPILImage()
     pic = toPIL(pred_saliency.squeeze())
@@ -257,6 +257,20 @@ def layered_vectorization(args,device=None):
                                                   struct_svgs_save_path,
                                                   args.train,
                                                   args.base_lr)
+    outline_shape_groups = [
+        pydiffvg.ShapeGroup(
+            shape_ids=group.shape_ids,
+            fill_color=torch.FloatTensor([1, 1, 1, 1]),
+            stroke_color=torch.FloatTensor([0, 0, 0, 1])
+        )
+        for group in shape_groups
+    ]
+    original_stroke_widths = [s.stroke_width.clone() for s in shapes]
+    for s in shapes:
+        s.stroke_width = torch.tensor(1.5)
+    pydiffvg.save_svg(f"./workdir/{args.file_save_name}/pre-color-fitting.svg", img_height, img_width, shapes, outline_shape_groups)
+    for s, w in zip(shapes, original_stroke_widths):
+        s.stroke_width = w
     if args.color_fitting_type not in ["dominan","mse"]:
         raise ValueError(f"args.color_fitting_type can only be 'dominan' or 'mse', but the values passed in are {args.color_fitting_type}")
     if args.color_fitting_type == "dominan":
@@ -335,31 +349,13 @@ def load_config(file_path,args):
 
 
 if __name__ == "__main__":
-    # parser = argparse.ArgumentParser(description="layered_image_vectorization",)
-    # parser.add_argument("-c", "--config", type=str, default="./config/base_config.yaml",help="YAML/YML file for configuration.")
-    # parser.add_argument("-timg", "--target_image", default="./target_imgs/Snipaste_2024-11-19_16-31-12.png", type=str)
-    # parser.add_argument("-fsn", "--file_save_name", type=str, default="man",help="Files save name.")
+    parser = argparse.ArgumentParser(description="layered_image_vectorization",)
+    parser.add_argument("-c", "--config", type=str, default="./config/base_config.yaml",help="YAML/YML file for configuration.")
+    parser.add_argument("-timg", "--target_image", default="./target_imgs/Snipaste_2024-11-19_16-31-12.png", type=str)
+    parser.add_argument("-fsn", "--file_save_name", type=str, default="man",help="Files save name.")
 
-    # args = parser.parse_args()
-    # args = load_config(args.config,args)
-    # device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
-    # init_diffvg(device=device)
-    # layered_vectorization(args,device)
-
-    import glob
-    # 定义文件夹路径
-    folder_path = '/home/sagemaker-user/layered_vectorization/LayeredVectorization/target_imgs'
-    # 获取所有 PNG 文件的路径
-    png_files = glob.glob(f'{folder_path}/*.png')
-
-    for i,file_path in enumerate(png_files):
-        parser = argparse.ArgumentParser(description="layered_image_vectorization",)
-        parser.add_argument("-c", "--config", type=str, default="./config/base_config.yaml",help="YAML/YML file for configuration.")
-        parser.add_argument("-timg", "--target_image", default=file_path, type=str)
-        parser.add_argument("-fsn", "--file_save_name", type=str, default=f"004/{file_path.split('/')[-1]}",help="Files save name.")
-
-        args = parser.parse_args()
-        args = load_config(args.config,args)
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        init_diffvg(device=device)
-        layered_vectorization(args,device)
+    args = parser.parse_args()
+    args = load_config(args.config,args)
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    init_diffvg(device=device)
+    layered_vectorization(args,device)

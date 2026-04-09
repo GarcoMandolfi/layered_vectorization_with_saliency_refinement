@@ -28,7 +28,7 @@ img = preprocess_img(test_img) # padding and resizing input image into 384x288
 img = np.array(img)/255.
 img = np.expand_dims(np.transpose(img,(2,0,1)),axis=0)
 img = torch.from_numpy(img)
-img = img.type(torch.cuda.FloatTensor).to(device)
+img = img.to(device, dtype=torch.float32)
 pred_saliency = model(img)
 toPIL = transforms.ToPILImage()
 pic = toPIL(pred_saliency.squeeze())
