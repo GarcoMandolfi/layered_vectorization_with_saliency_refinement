@@ -51,7 +51,7 @@ def decode(latent: T, pipe: StableDiffusionPipeline, im_cat: TN = None):
 
 def init_pipe(device, dtype, unet, scheduler) -> Tuple[UNet2DConditionModel, T, T]:
 
-    with torch.inference_mode():
+    with torch.no_grad():
         alphas = torch.sqrt(scheduler.alphas_cumprod).to(device, dtype=dtype)
         sigmas = torch.sqrt(1 - scheduler.alphas_cumprod).to(device, dtype=dtype)
     for p in unet.parameters():
@@ -81,7 +81,7 @@ class SDSLoss:
         latent_input = torch.cat([z_t] * 2)
         timestep = torch.cat([timestep] * 2)
         embedd = text_embeddings.permute(1, 0, 2, 3).reshape(-1, *text_embeddings.shape[2:])
-        with torch.autocast(device_type="cuda", dtype=torch.float16):
+        with torch.cuda.amp.autocast():
             e_t = self.unet(latent_input, timestep, embedd).sample
             if self.prediction_type == 'v_prediction':
                 e_t = torch.cat([alpha_t] * 2) * e_t + torch.cat([sigma_t] * 2) * latent_input
@@ -97,7 +97,7 @@ class SDSLoss:
 
     def get_sds_loss(self, z: T, text_embeddings: T, eps: TN = None, mask=None, t=None,
                  timestep: Optional[int] = None, guidance_scale=0) -> TS:
-        with torch.inference_mode():
+        with torch.no_grad():
             z_t, eps, timestep, alpha_t, sigma_t = self.noise_input(z, eps=eps, timestep=timestep)
             e_t, _ = self.get_eps_prediction(z_t, timestep, text_embeddings, alpha_t, sigma_t,
                                              guidance_scale=guidance_scale)
@@ -155,7 +155,7 @@ def sds_based_simplification(device, image: str, simp_img_seq_indexs: List[int],
     prompt = " "
     # model_id  =  "/home/ubuntu/workspace/WZY/Projects/image_vectorization-1.0/models--runwayml--stable-diffusion-v1-5/snapshots/1d0c4ebf6ff58a5caecab40fa1406526bca4b5b9"
     model_id = "runwayml/stable-diffusion-v1-5"
-    pipeline = StableDiffusionPipeline.from_pretrained(model_id).to(device)
+    pipeline = StableDiffusionPipeline.from_pretrained(model_id, use_safetensors=False).to(device)
     num_iters = simp_img_seq_indexs[0]
     all_simp_img_seq = image_optimization(device, pipeline, image, prompt,num_iters)
 

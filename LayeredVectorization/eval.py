@@ -84,7 +84,7 @@ def primitive_masks(shapes, shape_groups, height, width, device, alpha_threshold
     masks = []
     for g in shape_groups:
         img = svg_to_img(width, height, shapes, [g], device)
-        alpha = img[3].detach().cpu().numpy()
+        alpha = img[:, :, 3].detach().cpu().numpy()
         mask = (alpha > alpha_threshold).astype(np.uint8) * 255
         masks.append(mask)
     return masks
@@ -176,7 +176,9 @@ def evaluation(args):
     baseline_vec, saliency_vec = [], []
 
     for target_filename in tqdm(sorted(target_imgs), desc="Evaluating"):
-        name = os.path.splitext(target_filename)[0].removeprefix("resized_")
+        name = os.path.splitext(target_filename)[0]
+        if name.startswith("resized_"):
+            name = name[len("resized_"):]
         target_path = os.path.join(args.target_imgs, target_filename)
 
         baseline_svg = os.path.join(args.workdir, name, "final.svg")
