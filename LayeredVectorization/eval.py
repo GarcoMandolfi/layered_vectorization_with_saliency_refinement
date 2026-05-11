@@ -63,8 +63,8 @@ def caption_image(pil_img, processor, model, device):
 
 
 def init_clip(device):
-    processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-    model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+    processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
+    model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device)
     model.eval()
     return processor, model
 
@@ -166,7 +166,7 @@ def evaluation(args):
     blip_processor, blip_model = None, None
     clip_processor, clip_model = None, None
 
-    N = 5  # number of random path-removal runs to average over
+    N = 10  # number of random path-removal runs to average over
 
     baseline_mse, saliency_mse = [], []
     baseline_psnr, saliency_psnr = [], []
@@ -193,6 +193,12 @@ def evaluation(args):
         s_w, s_h, s_shapes, s_groups = parse_svg(saliency_svg)
         baseline_img = render_to_numpy(b_w, b_h, b_shapes, b_groups, device)
         saliency_img = render_to_numpy(s_w, s_h, s_shapes, s_groups, device)
+
+        th, tw = target_img.shape[:2]
+        if baseline_img.shape[:2] != (th, tw):
+            baseline_img = np.array(Image.fromarray(baseline_img).resize((tw, th), Image.LANCZOS))
+        if saliency_img.shape[:2] != (th, tw):
+            saliency_img = np.array(Image.fromarray(saliency_img).resize((tw, th), Image.LANCZOS))
 
         if target_filename not in caption_cache:
             if blip_model is None:
