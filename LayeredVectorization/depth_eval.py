@@ -9,6 +9,8 @@ inspect mask counts, then we layer in depth inference next.
 """
 
 import argparse
+import csv
+import glob
 import os
 import yaml
 import numpy as np
@@ -26,10 +28,12 @@ MODEL_REGISTRY = {
     "dpt_base":  {"hf_id": "Intel/dpt-beit-base-384",                   "larger_is_closer": True},
     "da_base":   {"hf_id": "LiheYoung/depth-anything-base-hf",          "larger_is_closer": True},
     "dav2_base": {"hf_id": "depth-anything/Depth-Anything-V2-Base-hf",  "larger_is_closer": True},
+    "glpn":      {"hf_id": "vinvino02/glpn-nyu",                        "larger_is_closer": False},
+    "zoeDepth":  {"hf_id": "Intel/zoedepth-nyu-kitti",                  "larger_is_closer": False},
 }
 
 MIN_AREA_FRAC = 0.002  # drop SAM masks smaller than 0.2% of image area
-VIS_MAX_MASKS = 12     # cap masks shown in the diagnostic PNG
+VIS_MAX_MASKS = 12     # plot-only cap; metrics use every mask above MIN_AREA_FRAC
 
 
 def load_sam_config(path):
@@ -113,6 +117,54 @@ def per_mask_stats(depth, masks):
 def sort_back_to_front(stats):
     """Return indices that sort masks farthest -> nearest."""
     return sorted(range(len(stats)), key=lambda i: stats[i]["median"], reverse=True)
+
+
+TAU_IOU_THRESH = 0.3  # min IoU to treat a L>0 mask as the same region as an L0 mask
+
+
+def _iou(a, b):
+    inter = int(np.logical_and(a, b).sum())
+    union = int(np.logical_or(a, b).sum())
+    return inter / union if union > 0 else 0.0
+
+
+def kendall_tau(a, b):
+    """Kendall's tau between two value lists. Ties are ignored."""
+    n = len(a)
+    if n < 2:
+        return float("nan")
+    concordant = discordant = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            da = a[i] - a[j]
+            db = b[i] - b[j]
+            if da * db > 0:
+                concordant += 1
+            elif da * db < 0:
+                discordant += 1
+    denom = n * (n - 1) / 2
+    return (concordant - discordant) / denom if denom > 0 else float("nan")
+
+
+def cross_level_tau(masks_lvl, stats_lvl, masks_l0, stats_l0,
+                    iou_thresh=TAU_IOU_THRESH):
+    """IoU-match each L>0 mask to its best L0 mask, then Kendall's tau between
+    matched median depths. Reflects how well the model preserves the
+    back-to-front order when boundaries shift under simplification.
+    """
+    if not masks_lvl or not masks_l0:
+        return float("nan")
+    matched_lvl, matched_l0 = [], []
+    for m, s in zip(masks_lvl, stats_lvl):
+        best_i, best_iou = -1, 0.0
+        for i, m0 in enumerate(masks_l0):
+            v = _iou(m, m0)
+            if v > best_iou:
+                best_iou, best_i = v, i
+        if best_iou >= iou_thresh:
+            matched_lvl.append(s["median"])
+            matched_l0.append(stats_l0[best_i]["median"])
+    return kendall_tau(matched_lvl, matched_l0)
 
 
 def _render_diagnostic_row(ax_row, image_rgb, depth, masks, stats, row_label,
@@ -201,6 +253,123 @@ def render_multilevel_diagnostic(rows, out_path, model_key, image_name):
     plt.close(fig)
 
 
+def write_cross_model_summary_csv(model_tables, out_path):
+    """One CSV per image: per-level rows across all tested models, plus an
+    'avg' row after each model summarizing its metrics across levels.
+
+    Columns: model, level, n_masks, spread, mean_iqr, separability, tau.
+    NaN tau (L0) is written as an empty cell; inf separability as 'inf'.
+    The 'avg' row averages spread/mean_iqr/n_masks across all levels, and
+    averages separability/tau across the levels where they are finite/defined.
+    """
+    if not model_tables:
+        return
+    with open(out_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["model", "level", "n_masks", "spread", "mean_iqr",
+                    "separability", "tau"])
+        for model_key, rows in model_tables.items():
+            for r in rows:
+                tau = "" if np.isnan(r["tau"]) else round(float(r["tau"]), 4)
+                if np.isfinite(r["separability"]):
+                    sep = round(float(r["separability"]), 4)
+                else:
+                    sep = "inf"
+                w.writerow([
+                    model_key,
+                    r["level"],
+                    r["n_masks"],
+                    round(float(r["spread"]),   4),
+                    round(float(r["mean_iqr"]), 4),
+                    sep,
+                    tau,
+                ])
+
+            spreads = [r["spread"]   for r in rows]
+            iqrs    = [r["mean_iqr"] for r in rows]
+            n_masks = [r["n_masks"]  for r in rows]
+            seps    = [r["separability"] for r in rows if np.isfinite(r["separability"])]
+            taus    = [r["tau"]          for r in rows if not np.isnan(r["tau"])]
+            avg_sep = round(float(np.mean(seps)), 4) if seps else ""
+            avg_tau = round(float(np.mean(taus)), 4) if taus else ""
+            w.writerow([
+                model_key,
+                "avg",
+                round(float(np.mean(n_masks)), 1),
+                round(float(np.mean(spreads)), 4),
+                round(float(np.mean(iqrs)),    4),
+                avg_sep,
+                avg_tau,
+            ])
+
+
+def aggregate_summaries_across_images(summaries_dir, out_path):
+    """Combine all per-image summary CSVs in summaries_dir into one collapsed
+    cross-image table: one row per model.
+
+    For each image:
+      - spread, mean_iqr, separability are taken from the L0 row (crisp masks,
+        canonical model quality).
+      - tau is averaged across L>0 (single ordering-stability number).
+    The cross-image table is then the mean of those per-image values per model.
+    'inf' separability values are excluded from their mean.
+    """
+    if not os.path.isdir(summaries_dir):
+        return
+    csv_paths = sorted(glob.glob(os.path.join(summaries_dir, "*.csv")))
+    if not csv_paths:
+        return
+
+    per_image = {}  # model -> list of per-image dicts
+    for p in csv_paths:
+        rows_by_model = {}
+        with open(p, "r", newline="") as f:
+            for row in csv.DictReader(f):
+                if row["level"] == "avg":
+                    continue
+                rows_by_model.setdefault(row["model"], []).append(row)
+
+        for model, rows in rows_by_model.items():
+            l0 = next((r for r in rows if r["level"] == "0"), None)
+            if l0 is None:
+                continue
+            sep_raw = l0["separability"]
+            sep_val = float("inf") if sep_raw == "inf" else float(sep_raw)
+            taus = [float(r["tau"]) for r in rows
+                    if r["level"] != "0" and r["tau"] != ""]
+            tau_avg = float(np.mean(taus)) if taus else float("nan")
+            per_image.setdefault(model, []).append({
+                "spread":       float(l0["spread"]),
+                "mean_iqr":     float(l0["mean_iqr"]),
+                "separability": sep_val,
+                "tau":          tau_avg,
+            })
+
+    if not per_image:
+        return
+
+    with open(out_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["model", "n_images", "spread", "mean_iqr",
+                    "separability", "tau"])
+        for model in sorted(per_image.keys()):
+            entries = per_image[model]
+            spreads = [e["spread"]   for e in entries]
+            iqrs    = [e["mean_iqr"] for e in entries]
+            seps    = [e["separability"] for e in entries if np.isfinite(e["separability"])]
+            taus    = [e["tau"]          for e in entries if not np.isnan(e["tau"])]
+            sep_cell = round(float(np.mean(seps)), 4) if seps else "inf"
+            tau_cell = round(float(np.mean(taus)), 4) if taus else ""
+            w.writerow([
+                model,
+                len(entries),
+                round(float(np.mean(spreads)), 4),
+                round(float(np.mean(iqrs)),    4),
+                sep_cell,
+                tau_cell,
+            ])
+
+
 SIMPLIFICATION_LEVELS = [0, 20, 40, 60, 80]  # 0 = original; 80 = most simplified
 
 
@@ -279,35 +448,71 @@ def run_simplified_depth_phase(model_key, name, level_images, level_masks,
     print(f"\n=== {model_key} ({meta['hf_id']}) ===")
     print(f"L0 depth [{depth.min():.2f}, {depth.max():.2f}] (shared across all levels)")
 
-    rows = []
+    depth_range = float(depth.max() - depth.min())
+
+    per_level = {}
     for L in SIMPLIFICATION_LEVELS:
         masks_all = level_masks[L]
         if not masks_all:
             print(f"L{L:>2d}: no masks above area threshold — skipping")
             continue
-        masks_vis = masks_all[:VIS_MAX_MASKS]
-        stats = per_mask_stats(depth, masks_vis)
-        order = sort_back_to_front(stats)
-        depth_range = depth.max() - depth.min()
-        medians = [stats[i]["median"] for i in order]
-        iqrs    = [stats[i]["iqr"]    for i in order]
+        stats_all = per_mask_stats(depth, masks_all)
+        order = sort_back_to_front(stats_all)
+        medians = [stats_all[i]["median"] for i in order]
+        iqrs    = [stats_all[i]["iqr"]    for i in order]
         spread  = (medians[0] - medians[-1]) / depth_range if depth_range > 0 else 0.0
+        mean_iqr = float(np.mean(iqrs)) / depth_range if depth_range > 0 else float("nan")
+        separability = (spread / (spread + mean_iqr)) if mean_iqr > 0 else float("inf")
+        per_level[L] = {
+            "masks_all":    masks_all,
+            "stats_all":    stats_all,
+            "masks_vis":    masks_all[:VIS_MAX_MASKS],
+            "stats_vis":    stats_all[:VIS_MAX_MASKS],
+            "n_total":      len(masks_all),
+            "spread":       spread,
+            "mean_iqr":     mean_iqr,
+            "separability": separability,
+        }
 
-        print(f"L{L:>2d}: {len(masks_all)} masks ({len(masks_vis)} shown) | "
-              f"spread {spread:.2%} | mean IQR {np.mean(iqrs):.3f}")
+    l0_data = per_level.get(0)
+    rows, table_rows = [], []
+    for L in SIMPLIFICATION_LEVELS:
+        if L not in per_level:
+            continue
+        d = per_level[L]
+        if L == 0 or l0_data is None:
+            tau = float("nan")
+        else:
+            tau = cross_level_tau(
+                d["masks_all"], d["stats_all"],
+                l0_data["masks_all"], l0_data["stats_all"],
+            )
+        tau_str = "—" if np.isnan(tau) else f"{tau:+.2f}"
+        print(f"L{L:>2d}: {d['n_total']} masks scored ({len(d['masks_vis'])} shown) | "
+              f"spread {d['spread']:.2%} | meanIQR {d['mean_iqr']:.3f} | "
+              f"sep {d['separability']:.2f} | tau vs L0: {tau_str}")
 
         rows.append({
             "level":     L,
             "image_rgb": level_images[L],
             "depth":     depth,
-            "masks":     masks_vis,
-            "stats":     stats,
+            "masks":     d["masks_vis"],
+            "stats":     d["stats_vis"],
+        })
+        table_rows.append({
+            "level":        L,
+            "n_masks":      d["n_total"],
+            "spread":       d["spread"],
+            "mean_iqr":     d["mean_iqr"],
+            "separability": d["separability"],
+            "tau":          tau,
         })
 
     png_path = os.path.join(output_dir, model_key, f"{name}__multilevel.png")
     os.makedirs(os.path.dirname(png_path), exist_ok=True)
     render_multilevel_diagnostic(rows, png_path, model_key, name)
     print(f"saved: {png_path}")
+    return table_rows
 
 
 def main():
@@ -316,8 +521,9 @@ def main():
                     "for one image. Reuses cached SAM masks; depth is inferred on "
                     "every level."
     )
-    parser.add_argument("--name", required=True,
-                        help="Image name (folder under workdir/, e.g. 'gramps').")
+    parser.add_argument("--name", required=True, nargs="+",
+                        help="One or more image names (folders under workdir/, "
+                             "e.g. --name gramps berengo_asylum).")
     parser.add_argument("--workdir", default="./workdir",
                         help="Folder containing <name>/simplified_image_sequence/.")
     parser.add_argument("--output", default="./depth_eval_output",
@@ -334,23 +540,44 @@ def main():
 
     sam_cache_dir = os.path.join(args.output, "sam_masks_full")
     os.makedirs(sam_cache_dir, exist_ok=True)
+    summaries_dir = os.path.join(args.output, "summaries")
 
-    level_images = load_simplified_levels(args.workdir, args.name)
-    print(f"Loaded {len(level_images)} levels for '{args.name}'.")
+    for name in args.name:
+        print(f"\n=== Image: {name} ===")
+        try:
+            level_images = load_simplified_levels(args.workdir, name)
+        except FileNotFoundError as e:
+            print(f"Skipping '{name}': {e}")
+            continue
+        print(f"Loaded {len(level_images)} levels for '{name}'.")
 
-    level_masks = collect_per_level_masks(
-        args.name, level_images, sam_cache_dir, device, sam_conf,
-    )
-    if not any(level_masks.values()):
-        print(f"No masks above area threshold for '{args.name}' — aborting.")
-        return
-    print("Per-level mask counts: " +
-          ", ".join(f"L{L}={len(level_masks[L])}" for L in SIMPLIFICATION_LEVELS))
-
-    for model_key in args.models:
-        run_simplified_depth_phase(
-            model_key, args.name, level_images, level_masks, args.output, device,
+        level_masks = collect_per_level_masks(
+            name, level_images, sam_cache_dir, device, sam_conf,
         )
+        if not any(level_masks.values()):
+            print(f"No masks above area threshold for '{name}' — skipping.")
+            continue
+        print("Per-level mask counts: " +
+              ", ".join(f"L{L}={len(level_masks[L])}" for L in SIMPLIFICATION_LEVELS))
+
+        model_tables = {}
+        for model_key in args.models:
+            table_rows = run_simplified_depth_phase(
+                model_key, name, level_images, level_masks, args.output, device,
+            )
+            if table_rows:
+                model_tables[model_key] = table_rows
+
+        if model_tables:
+            os.makedirs(summaries_dir, exist_ok=True)
+            summary_path = os.path.join(summaries_dir, f"{name}__summary.csv")
+            write_cross_model_summary_csv(model_tables, summary_path)
+            print(f"saved cross-model summary: {summary_path}")
+
+    cross_path = os.path.join(args.output, "cross_image_summary.csv")
+    aggregate_summaries_across_images(summaries_dir, cross_path)
+    if os.path.exists(cross_path):
+        print(f"saved cross-image aggregate: {cross_path}")
 
 
 if __name__ == "__main__":
