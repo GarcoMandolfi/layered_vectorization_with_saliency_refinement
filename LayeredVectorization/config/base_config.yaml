@@ -12,6 +12,12 @@ paths_merge_color_threshold: 0.1
 paths_merge_distance_threshold: 3
 paths_remove_visual_threshold: 7.0
 
+# Structural path merging (depth-aware), run once before visual refinement
+use_struct_merge: True
+struct_merge_color_threshold: 0.1
+struct_merge_distance_threshold: 3
+struct_merge_depth_threshold: 0.1
+
 # Perform kmeans clustering on target images to reduce color categories
 is_cluster_target_img: True
 kmeas_k: 80

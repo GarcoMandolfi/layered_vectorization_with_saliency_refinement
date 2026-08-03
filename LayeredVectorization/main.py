@@ -11,6 +11,7 @@ from sds_image_simplicity import sds_based_simplification
 import pydiffvg
 import yaml
 import cv2
+from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 
 def init_diffvg(device: torch.device,
                 use_gpu: bool = torch.cuda.is_available(),
@@ -216,6 +217,38 @@ def compute_saliency_map(device: torch.device, target_img: np.ndarray):
     pred_saliency = postprocess_img(pic, target_img) # restore the image to its original size as the result
     return pred_saliency
 
+def compute_depth_map(device: torch.device, target_img: np.ndarray, hf_id="Intel/dpt-beit-base-384", larger_is_closer=True, normalize=True):
+    """Relative depth for the (RGB, uint8) target image.
+    Returns float32 [H, W]; larger value = farther (back-to-front).
+    If normalize, rescaled to [0, 1] so a depth threshold is comparable
+    across images."""
+    H, W = target_img.shape[:2]
+
+    processor = AutoImageProcessor.from_pretrained(hf_id)
+    model = AutoModelForDepthEstimation.from_pretrained(hf_id).to(device).eval()
+
+    inputs = processor(images=Image.fromarray(target_img), return_tensors="pt").to(device)
+    with torch.no_grad():
+        pred = model(**inputs).predicted_depth
+    if pred.dim() == 3:             # (1, H', W')
+        pred = pred.unsqueeze(1)    # (1, 1, H', W')
+
+    pred = F.interpolate(pred, size=(H, W), mode="bilinear", align_corners=False)
+    depth = pred.squeeze().cpu().numpy().astype(np.float32)
+
+    if larger_is_closer:
+        depth = -depth
+
+    del processor, model
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    if normalize:
+        d_lo, d_hi = float(depth.min()), float(depth.max())
+        depth = (depth - d_lo) / max(d_hi - d_lo, 1e-8)
+
+    return depth
+
 def layered_vectorization(args,device=None):
     simp_img_seq_save_path = f"./workdir/{args.file_save_name}/simplified_image_sequence"
     os.makedirs(simp_img_seq_save_path,exist_ok=True)
@@ -279,11 +312,27 @@ def layered_vectorization(args,device=None):
         target_img_cluster_.save(f"./workdir/{args.file_save_name}/cluster_img.png")
         pydiffvg.save_svg(f"./workdir/{args.file_save_name}/color-adjusted.svg",img_height,img_width,shapes,shape_groups)
 
-    print("Visual Refinement...")
+    # Structural path merging
     pseudo_struct_masks = [mask for sublist in layerd_struct_masks for mask in sublist]
     is_opt_list = []
     count = 0
     struct_path_num = len(shapes)
+    if args.use_struct_merge:
+        print("Structural Path Merging...")
+        dpt = compute_depth_map(device, target_img)
+        shapes, shape_groups, pseudo_struct_masks, is_opt_list, struct_path_num = merge_path(
+            shapes, shape_groups, device,
+            img_width, img_height,
+            struct_path_num,
+            pseudo_struct_masks,
+            is_opt_list,
+            color_threshold=args.struct_merge_color_threshold,
+            overlapping_area_threshold=args.struct_merge_distance_threshold,
+            depth_map=dpt,
+            depth_threshold=args.struct_merge_depth_threshold
+        )
+
+    print("Visual Refinement...")
     saliency_map = compute_saliency_map(device,target_img)
     cv2.imwrite(f"./workdir/{args.file_save_name}/saliency_map.png", saliency_map, [int(cv2.IMWRITE_JPEG_QUALITY), 100])
     for i in range(args.add_visual_path_num_iters):
@@ -356,6 +405,8 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     args = load_config(args.config,args)
+    if args.use_struct_merge:
+        args.file_save_name += "_struct_merge"
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     init_diffvg(device=device)
     layered_vectorization(args,device)

@@ -671,37 +671,49 @@ def merge_path(shapes,shape_groups,device,
                img_width: int, 
                img_height: int,
                struct_path_num: int,
-               pseudo_struct_masks: List[np.ndarray], 
+               pseudo_struct_masks: List[np.ndarray],
                is_opt_list: List[int],
                color_threshold: float = 0.05,
-               overlapping_area_threshold: int = 3):
+               overlapping_area_threshold: int = 3,
+               depth_map: np.ndarray = None,
+               depth_threshold: float = None):
     
-    def is_merge(shape_img,shape_img1,color,color1):
-        if torch.sum((shape_img+shape_img1) > 1.9).item() >= overlapping_area_threshold and torch.sum(torch.abs(color-color1))<=color_threshold:
-            return True
+    def is_merge(shape_img,shape_img1,color,color1, depth, depth1):
+        overlap = torch.sum((shape_img + shape_img1) > 1.9).item() >= overlapping_area_threshold
+        colour = torch.sum(torch.abs(color - color1)) <= color_threshold
+        if structural:
+            return overlap and colour and abs(depth - depth1) <= depth_threshold
         else:
-            return False
+            return overlap and colour
 
-    def merge_obj(shape_img,shape_img1,color,color1,record1,record2):
+    def merge_obj(shape_img,shape_img1,color,color1,depth, depth1, record1,record2):
         new_shape_img = shape_img+shape_img1
         new_shape_img = torch.clamp(new_shape_img,max=1)
         new_color = ((color+color1)/2).detach()
         new_record=record1+record2
-        return new_shape_img,new_color,new_record
+
+        if structural:
+            m = (new_shape_img > 0.5).detach().cpu().numpy()
+            new_depth = float(np.median(depth_map[m])) if m.any() else float("nan")
+        else:
+            new_depth = None
+        return new_shape_img,new_color,new_depth, new_record
     
-    def merge_objs_based_on_threshold(path_raster_imgs,path_color_list):
+    def merge_objs_based_on_threshold(path_raster_imgs,path_color_list, path_depth_list):
         record_list = [[i] for i in range(len(path_raster_imgs))]
         merged = False
         i = 0
         while i < len(path_raster_imgs):
             j = i + 1
             while j < len(path_raster_imgs):
-                if is_merge(path_raster_imgs[i],path_raster_imgs[j],path_color_list[i],path_color_list[j]):
-                    new_shape_img,new_color,new_record = merge_obj(path_raster_imgs[i],path_raster_imgs[j],path_color_list[i],path_color_list[j],record_list[i],record_list[j])
+                if is_merge(path_raster_imgs[i],path_raster_imgs[j],path_color_list[i],path_color_list[j], path_depth_list[i], path_depth_list[j]):
+                    new_shape_img,new_color,new_depth,new_record = merge_obj(path_raster_imgs[i],path_raster_imgs[j],path_color_list[i],path_color_list[j],path_depth_list[i], path_depth_list[j], record_list[i],record_list[j])
                     path_raster_imgs[i] = new_shape_img
                     path_raster_imgs.pop(j)
                     path_color_list[i] = new_color
                     path_color_list.pop(j)
+                    path_depth_list[i] = new_depth
+                    path_depth_list.pop(j)
                     record_list[i] = new_record
                     record_list.pop(j)
                     merged = True
@@ -716,8 +728,15 @@ def merge_path(shapes,shape_groups,device,
         record_list = [x for i,x in enumerate(record_list) if len(record_list[i])>1]
         return record_list,path_raster_imgs,path_color_list
     
-    struct_shapes,struct_shape_groups = shapes[:struct_path_num],shape_groups[:struct_path_num]
-    visual_shapes,visual_shape_groups = shapes[struct_path_num:],shape_groups[struct_path_num:]
+    structural = depth_map is not None
+
+    struct_shapes, struct_shape_groups = shapes[:struct_path_num], shape_groups[:struct_path_num]
+    visual_shapes, visual_shape_groups = shapes[struct_path_num:], shape_groups[struct_path_num:]
+
+    if structural:
+        working_shapes, working_shape_groups = struct_shapes, struct_shape_groups
+    else:
+        working_shapes, working_shape_groups = visual_shapes, visual_shape_groups
 
     black_pg = torch.tensor([0., 0., 0.], requires_grad=False, device=device)
     white_path_group = pydiffvg.ShapeGroup(
@@ -726,21 +745,33 @@ def merge_path(shapes,shape_groups,device,
                                 stroke_color=torch.FloatTensor([1,1,1,1])
                             )
     path_raster_imgs=[]
-    for shape in visual_shapes:
+    for shape in working_shapes:
         img = svg_to_img(img_width,img_height,[shape],[white_path_group],device)
         img = rgba_to_rgb(img,device=device,para_bg=black_pg)
         img = img[0]
         path_raster_imgs.append(img)
     path_color_list=[]
-    for shape_group in visual_shape_groups:
+    for shape_group in working_shape_groups:
         path_color_list.append(shape_group.fill_color)
 
-    record_list,merge_imgs,merge_color_list = merge_objs_based_on_threshold(path_raster_imgs,path_color_list)
+    path_depth_list = []
+    if structural:
+        for raster in path_raster_imgs:
+            mask = (raster > 0.5).detach().cpu().numpy()
+            path_depth_list.append(float(np.median(depth_map[mask])) if mask.any() else float("nan"))
+    else:
+        path_depth_list = [None] * len(path_raster_imgs)
+
+    record_list,merge_imgs,merge_color_list = merge_objs_based_on_threshold(path_raster_imgs,path_color_list, path_depth_list)
 
     flattened_record_list = [item for sublist in record_list for item in sublist]       
-    visual_shapes = [x for i,x in enumerate(visual_shapes) if i not in flattened_record_list]
-    visual_shape_groups = [x for i,x in enumerate(visual_shape_groups) if i not in flattened_record_list]
-    is_opt_list = is_opt_list[:len(shapes)-len(flattened_record_list)]
+    working_shapes = [x for i,x in enumerate(working_shapes) if i not in flattened_record_list]
+    working_shape_groups = [x for i,x in enumerate(working_shape_groups) if i not in flattened_record_list]
+    if not structural:
+        is_opt_list = is_opt_list[:len(shapes)-len(flattened_record_list)]
+
+    if structural:
+        working_masks = [m for i, m in enumerate(pseudo_struct_masks) if i not in flattened_record_list]
 
     for i,record in enumerate(record_list):
         if len(record)>1:
@@ -752,11 +783,21 @@ def merge_path(shapes,shape_groups,device,
                             stroke_color=torch.FloatTensor([0,0,0,1])
                         )
             
-            visual_shapes.append(merge_path)
-            visual_shape_groups.append(merge_path_group)
-            is_opt_list.append(1)
-    shapes = struct_shapes+visual_shapes
-    shape_groups = struct_shape_groups+visual_shape_groups
+            working_shapes.append(merge_path)
+            working_shape_groups.append(merge_path_group)
+            if structural:
+                working_masks.append(new_mask)
+            else:
+                is_opt_list.append(1)
+
+    if structural:
+        shapes = working_shapes + visual_shapes
+        shape_groups = working_shape_groups + visual_shape_groups
+        pseudo_struct_masks = working_masks
+        struct_path_num = len(working_shapes)
+    else:
+        shapes = struct_shapes + working_shapes
+        shape_groups = struct_shape_groups + working_shape_groups
 
     for index,shape_group in enumerate(shape_groups):
         shape_group.shape_ids=torch.LongTensor([index])   
