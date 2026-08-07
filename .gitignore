@@ -9,3 +9,4 @@ __pycache__/
 **/struct&visual_svgs/
 **/__pycache__/
 **/depth_eval_output/
+*slurm*
